@@ -1,0 +1,16 @@
+[package]
+name = "vosk-commands"
+version = "0.1.0"
+edition = "2024"
+license-file = "LICENSE"
+
+[[bin]]
+name = "vosk_commands"
+path = "src/main.rs"
+
+[dependencies]
+branch-actuator = { path = "../../actuator" }
+vosk = "0.3"
+serde_json = { workspace = true }
+serde = { workspace = true }
+tokio = { workspace = true }
