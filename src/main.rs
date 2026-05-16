@@ -22,14 +22,15 @@ async fn main() {
 
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = env::args().skip(1).collect();
-    let (model_path, grammar_path) = parse_args(&args)?;
+    let stage_args = parse_args(&args)?;
+    let lifecycle_mode = stage_args.lifecycle_mode;
 
     // Resolve relative paths against exe directory
-    let model_path = resolve_relative_to_exe(&model_path);
+    let model_path = resolve_relative_to_exe(&stage_args.model);
     let model = Model::new(model_path.to_str().unwrap_or(&model_path.to_string_lossy()))
         .ok_or_else(|| format!("failed to load model from {}", model_path.display()))?;
 
-    let grammar: Vec<String> = if let Some(path) = grammar_path {
+    let grammar: Vec<String> = if let Some(path) = stage_args.grammar {
         let resolved = resolve_relative_to_exe(&path);
         let content = std::fs::read_to_string(&resolved)
             .map_err(|e| format!("failed to read grammar file {}: {e}", resolved.display()))?;
@@ -75,9 +76,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         ))
         .await?;
 
-    // Grant initial credit upstream
+    // Grant initial credit upstream (continuous mode needs more to cover startup)
+    let initial_frames = if lifecycle_mode == LifecycleMode::Continuous { 64 } else { 16 };
     let initial_credit = FlowCredit {
-        frames: 16,
+        frames: initial_frames,
         session_id: String::new(),
     };
     writer
@@ -86,6 +88,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             serde_json::to_value(&initial_credit)?,
         ))
         .await?;
+
+    if lifecycle_mode == LifecycleMode::Continuous {
+        eprintln!("[vosk_commands] continuous mode: no VAD gating, force-finalize every 0.8s");
+    }
 
     let mut current_session: Option<String> = None;
     let mut frames_since_credit: u32 = 0;
@@ -128,6 +134,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 eprintln!("[vosk_commands] recognizer reset → full grammar (cached)");
             }
             "audio_start" => {
+                if lifecycle_mode == LifecycleMode::Continuous {
+                    // In continuous mode, ignore session signals — audio flows continuously
+                    continue;
+                }
                 if let Some(sid) = event.data.get("session_id").and_then(Value::as_str) {
                     current_session = Some(sid.to_string());
                     eprintln!("[vosk_commands] session start: {}", &sid[..8.min(sid.len())]);
@@ -222,11 +232,12 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 frames_since_credit += 1;
                 if frames_since_credit >= 4 {
                     frames_since_credit = 0;
+                    let replenish = if lifecycle_mode == LifecycleMode::Continuous { 8 } else { 4 };
                     writer
                         .write_event(&Event::new(
                             event_type::FLOW_CREDIT,
                             serde_json::to_value(&FlowCredit {
-                                frames: 4,
+                                frames: replenish,
                                 session_id: chunk.session_id,
                             })?,
                         ))
@@ -234,6 +245,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
             "audio_stop" => {
+                if lifecycle_mode == LifecycleMode::Continuous {
+                    continue;
+                }
                 let result = active_rec!().final_result();
                 let (text, confidence, alts) = extract_best_result(&result)
                     .unwrap_or_else(|| (String::new(), 0.0, vec![]));
@@ -268,9 +282,22 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 /// Parse CLI args: supports both positional and flag-style.
 /// Positional: `vosk_commands <model-path> [grammar.json]`
 /// Flags: `vosk_commands --model <path> --grammar <path>`
-fn parse_args(args: &[String]) -> Result<(String, Option<String>), String> {
+struct StageArgs {
+    model: String,
+    grammar: Option<String>,
+    lifecycle_mode: LifecycleMode,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum LifecycleMode {
+    Session,
+    Continuous,
+}
+
+fn parse_args(args: &[String]) -> Result<StageArgs, String> {
     let mut model = None;
     let mut grammar = None;
+    let mut lifecycle_mode = None;
     let mut positional = Vec::new();
     let mut i = 0;
     while i < args.len() {
@@ -282,6 +309,10 @@ fn parse_args(args: &[String]) -> Result<(String, Option<String>), String> {
             "--grammar" => {
                 i += 1;
                 grammar = Some(args.get(i).ok_or("--grammar requires a value")?.clone());
+            }
+            "--lifecycle_mode" => {
+                i += 1;
+                lifecycle_mode = Some(args.get(i).ok_or("--lifecycle_mode requires a value")?.clone());
             }
             other if !other.starts_with("--") => {
                 positional.push(other.to_string());
@@ -295,7 +326,11 @@ fn parse_args(args: &[String]) -> Result<(String, Option<String>), String> {
         .or_else(|| positional.first().cloned())
         .ok_or_else(|| "usage: vosk_commands <model-path> [grammar.json] or --model <path> [--grammar <path>]".to_string())?;
     let grammar_path = grammar.or_else(|| positional.get(1).cloned());
-    Ok((model_path, grammar_path))
+    let mode = match lifecycle_mode.as_deref() {
+        Some("continuous") => LifecycleMode::Continuous,
+        _ => LifecycleMode::Session,
+    };
+    Ok(StageArgs { model: model_path, grammar: grammar_path, lifecycle_mode: mode })
 }
 
 fn extract_best_result(result: &CompleteResult) -> Option<(String, f32, Vec<TranscriptAlternative>)> {
