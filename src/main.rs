@@ -97,6 +97,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut frames_since_credit: u32 = 0;
     let mut skip_next_reset = false;
     let mut samples_since_finalize: u32 = 0;
+    let mut last_partial: Option<String> = None;
     let mut force_finalize_samples: u32 = (SAMPLE_RATE * 0.8) as u32;
     const DEFAULT_FORCE_FINALIZE_SAMPLES: u32 = (SAMPLE_RATE * 0.8) as u32;
 
@@ -204,7 +205,14 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                         samples_since_finalize = 0;
                         Some(active_rec!().final_result())
                     }
-                    Ok(DecodingState::Running) => None,
+                    Ok(DecodingState::Running) => {
+                        let pr = active_rec!().partial_result();
+                        let text = pr.partial.trim();
+                        if !text.is_empty() {
+                            last_partial = Some(strip_unk(text));
+                        }
+                        None
+                    }
                     Ok(DecodingState::Failed) => {
                         eprintln!("[vosk_commands] decoding failed");
                         None
@@ -221,6 +229,12 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                         .unwrap_or_else(|| (String::new(), 0.0, vec![]));
                     let session_id = current_session.clone()
                         .unwrap_or_else(|| chunk.session_id.clone());
+                    let partial_hint = if text.is_empty() {
+                        last_partial.take()
+                    } else {
+                        last_partial = None;
+                        None
+                    };
                     if !text.is_empty() {
                         let tag = if forced { " (forced)" } else { "" };
                         let rec_tag = if is_narrowed { " [narrowed]" } else { " [full]" };
@@ -228,7 +242,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     } else {
                         let tag = if forced { " (forced)" } else { "" };
                         let rec_tag = if is_narrowed { " [narrowed]" } else { " [full]" };
-                        eprintln!("[vosk_commands] empty{tag}{rec_tag}: conf={confidence:.2}");
+                        let hint = partial_hint.as_deref().unwrap_or("");
+                        eprintln!("[vosk_commands] empty{tag}{rec_tag}: conf={confidence:.2} last_partial=\"{hint}\"");
                     }
                     writer
                         .write_event(&Event::new(
@@ -240,6 +255,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                                 partial: false,
                                 confidence: Some(confidence),
                                 alternatives: if alts.is_empty() { None } else { Some(alts) },
+                                last_partial: partial_hint,
                             })?,
                         ))
                         .await?;
@@ -268,10 +284,17 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 let result = active_rec!().final_result();
                 let (text, confidence, alts) = extract_best_result(&result)
                     .unwrap_or_else(|| (String::new(), 0.0, vec![]));
+                let partial_hint = if text.is_empty() {
+                    last_partial.take()
+                } else {
+                    last_partial = None;
+                    None
+                };
                 if !text.is_empty() {
                     eprintln!("[vosk_commands] final: \"{text}\" conf={confidence:.2}");
                 } else {
-                    eprintln!("[vosk_commands] final: empty conf={confidence:.2}");
+                    let hint = partial_hint.as_deref().unwrap_or("");
+                    eprintln!("[vosk_commands] final: empty conf={confidence:.2} last_partial=\"{hint}\"");
                 }
                 let session_id = current_session.take().unwrap_or_default();
                 writer
@@ -284,6 +307,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                             partial: false,
                             confidence: Some(confidence),
                             alternatives: if alts.is_empty() { None } else { Some(alts) },
+                            last_partial: partial_hint,
                         })?,
                     ))
                     .await?;
