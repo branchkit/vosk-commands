@@ -97,7 +97,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut frames_since_credit: u32 = 0;
     let mut skip_next_reset = false;
     let mut samples_since_finalize: u32 = 0;
-    const MAX_SAMPLES_BEFORE_FORCE_FINALIZE: u32 = (SAMPLE_RATE * 0.8) as u32;
+    let mut force_finalize_samples: u32 = (SAMPLE_RATE * 0.8) as u32;
+    const DEFAULT_FORCE_FINALIZE_SAMPLES: u32 = (SAMPLE_RATE * 0.8) as u32;
 
     loop {
         let event = match reader.read_event().await? {
@@ -121,7 +122,18 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                         narrowed_recognizer = Some(new_rec);
                         samples_since_finalize = 0;
                         skip_next_reset = true;
-                        eprintln!("[vosk_commands] grammar narrowed to {} words: {:?}", new_grammar.len(), new_grammar);
+                        force_finalize_samples = match event.data.get("force_finalize_ms").and_then(|v| v.as_u64()) {
+                            Some(0) => 0,
+                            Some(ms) => (SAMPLE_RATE * ms as f32 / 1000.0) as u32,
+                            None => {
+                                if event.data.get("force_finalize").and_then(|v| v.as_bool()) == Some(false) {
+                                    0
+                                } else {
+                                    DEFAULT_FORCE_FINALIZE_SAMPLES
+                                }
+                            }
+                        };
+                        eprintln!("[vosk_commands] grammar narrowed to {} words (force_finalize_ms={}): {:?}", new_grammar.len(), if force_finalize_samples == 0 { 0 } else { (force_finalize_samples as f32 / SAMPLE_RATE * 1000.0) as u32 }, new_grammar);
                     }
                 }
             }
@@ -131,6 +143,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 let silence = vec![0i16; (SAMPLE_RATE * 0.3) as usize];
                 let _ = full_recognizer.accept_waveform(&silence);
                 samples_since_finalize = 0;
+                force_finalize_samples = DEFAULT_FORCE_FINALIZE_SAMPLES;
                 eprintln!("[vosk_commands] recognizer reset → full grammar (cached)");
             }
             "audio_start" => {
@@ -175,10 +188,12 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
                 // Feed to Vosk
                 samples_since_finalize += samples.len() as u32;
+                let is_narrowed = narrowed_recognizer.is_some();
                 let state = active_rec!().accept_waveform(&samples);
 
-                let force_finalize = matches!(state, Ok(DecodingState::Running))
-                    && samples_since_finalize >= MAX_SAMPLES_BEFORE_FORCE_FINALIZE;
+                let force_finalize = force_finalize_samples > 0
+                    && matches!(state, Ok(DecodingState::Running))
+                    && samples_since_finalize >= force_finalize_samples;
 
                 let result = match state {
                     Ok(DecodingState::Finalized) => {
@@ -208,10 +223,12 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                         .unwrap_or_else(|| chunk.session_id.clone());
                     if !text.is_empty() {
                         let tag = if forced { " (forced)" } else { "" };
-                        eprintln!("[vosk_commands] recognized{tag}: \"{text}\" conf={confidence:.2}");
+                        let rec_tag = if is_narrowed { " [narrowed]" } else { " [full]" };
+                        eprintln!("[vosk_commands] recognized{tag}{rec_tag}: \"{text}\" conf={confidence:.2}");
                     } else {
                         let tag = if forced { " (forced)" } else { "" };
-                        eprintln!("[vosk_commands] empty{tag}: conf={confidence:.2}");
+                        let rec_tag = if is_narrowed { " [narrowed]" } else { " [full]" };
+                        eprintln!("[vosk_commands] empty{tag}{rec_tag}: conf={confidence:.2}");
                     }
                     writer
                         .write_event(&Event::new(
