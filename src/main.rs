@@ -48,7 +48,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     full_recognizer.set_words(true);
     full_recognizer.set_max_alternatives(3);
 
-    // Narrowed recognizer is created on grammar_update and dropped on reset.
+    // Narrowed recognizer is created on vocabulary_update and dropped on reset.
     // When None, full_recognizer is the active recognizer.
     let mut narrowed_recognizer: Option<Recognizer> = None;
 
@@ -108,7 +108,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         };
 
         match event.event_type.as_str() {
-            "grammar_update" => {
+            "vocabulary_update" => {
                 if let Some(words) = event.data.get("words").and_then(|v| v.as_array()) {
                     let new_grammar: Vec<String> = words.iter()
                         .filter_map(|v| v.as_str().map(String::from))
@@ -134,7 +134,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                                 }
                             }
                         };
-                        eprintln!("[vosk_commands] grammar narrowed to {} words (force_finalize_ms={}): {:?}", new_grammar.len(), if force_finalize_samples == 0 { 0 } else { (force_finalize_samples as f32 / SAMPLE_RATE * 1000.0) as u32 }, new_grammar);
+                        eprintln!("[vosk_commands] vocabulary narrowed to {} words (force_finalize_ms={}): {:?}", new_grammar.len(), if force_finalize_samples == 0 { 0 } else { (force_finalize_samples as f32 / SAMPLE_RATE * 1000.0) as u32 }, new_grammar);
                     }
                 }
             }
