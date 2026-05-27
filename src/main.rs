@@ -48,13 +48,31 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     full_recognizer.set_words(true);
     full_recognizer.set_max_alternatives(3);
 
-    // Narrowed recognizer is created on vocabulary_update and dropped on reset.
-    // When None, full_recognizer is the active recognizer.
-    let mut narrowed_recognizer: Option<Recognizer> = None;
+    // Dynamic recognizer is (re)created on every `vocabulary_update` event
+    // and dropped on `recognizer_reset`. When None, `full_recognizer` (the
+    // startup-loaded grammar) is the active one.
+    //
+    // What "dynamic" actually holds varies by sender — and historically
+    // the variable name was "narrowed_recognizer", which was misleading:
+    //
+    //   - Voice plugin's LockForSpeak / LockForSandbox push a *truly
+    //     narrow* word list (13 stop phrases / sandbox test words). These
+    //     are acoustic-task modes; narrowing is the point.
+    //   - Voice plugin's Init/Refresh push the full union grammar
+    //     (every command's words + plugin HWMs). Not narrowing — refresh.
+    //   - `vocabulary.commit` from any plugin (browser hints, etc.) goes
+    //     through the actuator's `send_vocabulary_update` path which
+    //     builds the full union vocab. Not narrowing — refresh.
+    //
+    // The recognizer slot is the same in all cases; only the word count
+    // tells you whether you're in an acoustic-task narrow mode vs. a
+    // routine refresh. Operator: read the word count, not the variable
+    // name.
+    let mut dynamic_recognizer: Option<Recognizer> = None;
 
     macro_rules! active_rec {
         () => {
-            narrowed_recognizer.as_mut().unwrap_or(&mut full_recognizer)
+            dynamic_recognizer.as_mut().unwrap_or(&mut full_recognizer)
         };
     }
 
@@ -120,7 +138,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                         new_rec.set_max_alternatives(3);
                         let silence = vec![0i16; (SAMPLE_RATE * 0.3) as usize];
                         let _ = new_rec.accept_waveform(&silence);
-                        narrowed_recognizer = Some(new_rec);
+                        dynamic_recognizer = Some(new_rec);
                         samples_since_finalize = 0;
                         skip_next_reset = true;
                         force_finalize_samples = match event.data.get("force_finalize_ms").and_then(|v| v.as_u64()) {
@@ -134,18 +152,18 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                                 }
                             }
                         };
-                        eprintln!("[vosk_commands] vocabulary narrowed to {} words (force_finalize_ms={}): {:?}", new_grammar.len(), if force_finalize_samples == 0 { 0 } else { (force_finalize_samples as f32 / SAMPLE_RATE * 1000.0) as u32 }, new_grammar);
+                        eprintln!("[vosk_commands] vocabulary updated to {} words (force_finalize_ms={}): {:?}", new_grammar.len(), if force_finalize_samples == 0 { 0 } else { (force_finalize_samples as f32 / SAMPLE_RATE * 1000.0) as u32 }, new_grammar);
                     }
                 }
             }
             "recognizer_reset" => {
-                narrowed_recognizer = None;
+                dynamic_recognizer = None;
                 full_recognizer.reset();
                 let silence = vec![0i16; (SAMPLE_RATE * 0.3) as usize];
                 let _ = full_recognizer.accept_waveform(&silence);
                 samples_since_finalize = 0;
                 force_finalize_samples = DEFAULT_FORCE_FINALIZE_SAMPLES;
-                eprintln!("[vosk_commands] recognizer reset → full grammar (cached)");
+                eprintln!("[vosk_commands] recognizer reset → startup grammar (cached)");
             }
             "audio_start" => {
                 if lifecycle_mode == LifecycleMode::Continuous {
@@ -189,7 +207,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
                 // Feed to Vosk
                 samples_since_finalize += samples.len() as u32;
-                let is_narrowed = narrowed_recognizer.is_some();
+                let is_dynamic = dynamic_recognizer.is_some();
                 let state = active_rec!().accept_waveform(&samples);
 
                 let force_finalize = force_finalize_samples > 0
@@ -237,11 +255,11 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     };
                     if !text.is_empty() {
                         let tag = if forced { " (forced)" } else { "" };
-                        let rec_tag = if is_narrowed { " [narrowed]" } else { " [full]" };
+                        let rec_tag = if is_dynamic { " [dynamic]" } else { " [startup]" };
                         eprintln!("[vosk_commands] recognized{tag}{rec_tag}: \"{text}\" conf={confidence:.2}");
                     } else {
                         let tag = if forced { " (forced)" } else { "" };
-                        let rec_tag = if is_narrowed { " [narrowed]" } else { " [full]" };
+                        let rec_tag = if is_dynamic { " [dynamic]" } else { " [startup]" };
                         let hint = partial_hint.as_deref().unwrap_or("");
                         eprintln!("[vosk_commands] empty{tag}{rec_tag}: conf={confidence:.2} last_partial=\"{hint}\"");
                     }
