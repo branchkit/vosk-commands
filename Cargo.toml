@@ -10,6 +10,7 @@ path = "src/main.rs"
 
 [dependencies]
 branch-actuator = { path = "../../actuator" }
+chrono = "0.4"
 vosk = "0.3"
 serde_json = { workspace = true }
 serde = { workspace = true }

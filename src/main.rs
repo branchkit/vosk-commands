@@ -12,10 +12,23 @@ use vosk::{CompleteResult, DecodingState, Model, Recognizer};
 
 const SAMPLE_RATE: f32 = 16000.0;
 
+// Stage log line: leading RFC3339-millis UTC timestamp matching actuator.log's
+// `[2026-06-01T05:55:13.116Z]` prefix so the two logs correlate on one clock,
+// then the `[vosk_commands]` tag. Use this instead of bare `eprintln!`.
+macro_rules! vlog {
+    ($($arg:tt)*) => {{
+        eprintln!(
+            "[{}] [vosk_commands] {}",
+            chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ"),
+            format_args!($($arg)*)
+        );
+    }};
+}
+
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
     if let Err(e) = run().await {
-        eprintln!("[vosk_commands] fatal: {e}");
+        vlog!("fatal: {e}");
         process::exit(1);
     }
 }
@@ -108,7 +121,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .await?;
 
     if lifecycle_mode == LifecycleMode::Continuous {
-        eprintln!("[vosk_commands] continuous mode: no VAD gating, force-finalize every 0.8s");
+        vlog!("continuous mode: no VAD gating, force-finalize every 0.8s");
     }
 
     let mut current_session: Option<String> = None;
@@ -171,7 +184,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                             skip_next_reset = true;
                             force_finalize_samples = force_finalize();
                             last_grammar = Some(new_grammar.clone());
-                            eprintln!("[vosk_commands] vocabulary updated to {} words (force_finalize_ms={}): {:?}", new_grammar.len(), if force_finalize_samples == 0 { 0 } else { (force_finalize_samples as f32 / SAMPLE_RATE * 1000.0) as u32 }, new_grammar);
+                            vlog!("vocabulary updated to {} words (force_finalize_ms={}): {:?}", new_grammar.len(), if force_finalize_samples == 0 { 0 } else { (force_finalize_samples as f32 / SAMPLE_RATE * 1000.0) as u32 }, new_grammar);
                         }
                     }
                 }
@@ -183,7 +196,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 let _ = full_recognizer.accept_waveform(&silence);
                 samples_since_finalize = 0;
                 force_finalize_samples = DEFAULT_FORCE_FINALIZE_SAMPLES;
-                eprintln!("[vosk_commands] recognizer reset → startup grammar (cached)");
+                vlog!("recognizer reset → startup grammar (cached)");
             }
             "audio_start" => {
                 if lifecycle_mode == LifecycleMode::Continuous {
@@ -192,7 +205,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 if let Some(sid) = event.data.get("session_id").and_then(Value::as_str) {
                     current_session = Some(sid.to_string());
-                    eprintln!("[vosk_commands] session start: {}", &sid[..8.min(sid.len())]);
+                    vlog!("session start: {}", &sid[..8.min(sid.len())]);
                 }
                 if skip_next_reset {
                     skip_next_reset = false;
@@ -252,11 +265,11 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                         None
                     }
                     Ok(DecodingState::Failed) => {
-                        eprintln!("[vosk_commands] decoding failed");
+                        vlog!("decoding failed");
                         None
                     }
                     Err(e) => {
-                        eprintln!("[vosk_commands] accept error: {e}");
+                        vlog!("accept error: {e}");
                         None
                     }
                 };
@@ -276,12 +289,12 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     if !text.is_empty() {
                         let tag = if forced { " (forced)" } else { "" };
                         let rec_tag = if is_dynamic { " [dynamic]" } else { " [startup]" };
-                        eprintln!("[vosk_commands] recognized{tag}{rec_tag}: \"{text}\" conf={confidence:.2}");
+                        vlog!("recognized{tag}{rec_tag}: \"{text}\" conf={confidence:.2}");
                     } else {
                         let tag = if forced { " (forced)" } else { "" };
                         let rec_tag = if is_dynamic { " [dynamic]" } else { " [startup]" };
                         let hint = partial_hint.as_deref().unwrap_or("");
-                        eprintln!("[vosk_commands] empty{tag}{rec_tag}: conf={confidence:.2} last_partial=\"{hint}\"");
+                        vlog!("empty{tag}{rec_tag}: conf={confidence:.2} last_partial=\"{hint}\"");
                     }
                     writer
                         .write_event(&Event::new(
@@ -329,10 +342,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     None
                 };
                 if !text.is_empty() {
-                    eprintln!("[vosk_commands] final: \"{text}\" conf={confidence:.2}");
+                    vlog!("final: \"{text}\" conf={confidence:.2}");
                 } else {
                     let hint = partial_hint.as_deref().unwrap_or("");
-                    eprintln!("[vosk_commands] final: empty conf={confidence:.2} last_partial=\"{hint}\"");
+                    vlog!("final: empty conf={confidence:.2} last_partial=\"{hint}\"");
                 }
                 let session_id = current_session.take().unwrap_or_default();
                 writer
