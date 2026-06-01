@@ -118,6 +118,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut last_partial: Option<String> = None;
     let mut force_finalize_samples: u32 = (SAMPLE_RATE * 0.8) as u32;
     const DEFAULT_FORCE_FINALIZE_SAMPLES: u32 = (SAMPLE_RATE * 0.8) as u32;
+    // Word set behind the live recognizer, used to skip redundant rebuilds.
+    let mut last_grammar: Option<Vec<String>> = None;
 
     loop {
         let event = match reader.read_event().await? {
@@ -131,17 +133,18 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     let new_grammar: Vec<String> = words.iter()
                         .filter_map(|v| v.as_str().map(String::from))
                         .collect();
-                    let refs: Vec<&str> = new_grammar.iter().map(|s| s.as_str()).collect();
-                    if let Some(mut new_rec) = Recognizer::new_with_grammar(&model, SAMPLE_RATE, &refs) {
-                        new_rec.set_partial_words(true);
-                        new_rec.set_words(true);
-                        new_rec.set_max_alternatives(3);
-                        let silence = vec![0i16; (SAMPLE_RATE * 0.3) as usize];
-                        let _ = new_rec.accept_waveform(&silence);
-                        dynamic_recognizer = Some(new_rec);
-                        samples_since_finalize = 0;
-                        skip_next_reset = true;
-                        force_finalize_samples = match event.data.get("force_finalize_ms").and_then(|v| v.as_u64()) {
+                    // The Vosk grammar is the union *word* set, not the matcher's
+                    // per-context narrowing. A scan storm (e.g. browser hints after a
+                    // page nav) re-pushes commands constantly but rarely changes the
+                    // word set — codewords reuse words already in vocab — so most
+                    // updates arrive byte-for-byte identical (the word list is sorted
+                    // upstream). Rebuilding the recognizer on an unchanged set is pure
+                    // cost: it drops in-progress audio and truncates a command spoken
+                    // across the rebuild (the "say it twice on a fresh page" bug).
+                    // Skip the rebuild when the word set is unchanged; still honor a
+                    // force-finalize change since that needs no new recognizer.
+                    let force_finalize = || -> u32 {
+                        match event.data.get("force_finalize_ms").and_then(|v| v.as_u64()) {
                             Some(0) => 0,
                             Some(ms) => (SAMPLE_RATE * ms as f32 / 1000.0) as u32,
                             None => {
@@ -151,8 +154,25 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                                     DEFAULT_FORCE_FINALIZE_SAMPLES
                                 }
                             }
-                        };
-                        eprintln!("[vosk_commands] vocabulary updated to {} words (force_finalize_ms={}): {:?}", new_grammar.len(), if force_finalize_samples == 0 { 0 } else { (force_finalize_samples as f32 / SAMPLE_RATE * 1000.0) as u32 }, new_grammar);
+                        }
+                    };
+                    if dynamic_recognizer.is_some() && last_grammar.as_deref() == Some(new_grammar.as_slice()) {
+                        force_finalize_samples = force_finalize();
+                    } else {
+                        let refs: Vec<&str> = new_grammar.iter().map(|s| s.as_str()).collect();
+                        if let Some(mut new_rec) = Recognizer::new_with_grammar(&model, SAMPLE_RATE, &refs) {
+                            new_rec.set_partial_words(true);
+                            new_rec.set_words(true);
+                            new_rec.set_max_alternatives(3);
+                            let silence = vec![0i16; (SAMPLE_RATE * 0.3) as usize];
+                            let _ = new_rec.accept_waveform(&silence);
+                            dynamic_recognizer = Some(new_rec);
+                            samples_since_finalize = 0;
+                            skip_next_reset = true;
+                            force_finalize_samples = force_finalize();
+                            last_grammar = Some(new_grammar.clone());
+                            eprintln!("[vosk_commands] vocabulary updated to {} words (force_finalize_ms={}): {:?}", new_grammar.len(), if force_finalize_samples == 0 { 0 } else { (force_finalize_samples as f32 / SAMPLE_RATE * 1000.0) as u32 }, new_grammar);
+                        }
                     }
                 }
             }
