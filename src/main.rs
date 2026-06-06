@@ -143,9 +143,21 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         match event.event_type.as_str() {
             "vocabulary_update" => {
                 if let Some(words) = event.data.get("words").and_then(|v| v.as_array()) {
-                    let new_grammar: Vec<String> = words.iter()
+                    let mut new_grammar: Vec<String> = words.iter()
                         .filter_map(|v| v.as_str().map(String::from))
                         .collect();
+                    // Canonicalize to a sorted, deduped SET before the unchanged-set
+                    // guard below — the guard must compare word-set membership, not
+                    // list order or duplicates. Upstream occasionally emits a word
+                    // twice (a `cancels_bridge` command word like "dismiss"/"over"
+                    // appended while a hint bridge is active), which toggles the list
+                    // length (e.g. 299<->297) without changing the set. Comparing raw
+                    // lists, that toggle defeats the guard and forces a recognizer
+                    // rebuild mid-utterance — landing while the user speaks the second
+                    // word of a two-word codeword, which endpoints the recognizer and
+                    // drops the tail (the "say it twice on a fresh page" truncation).
+                    new_grammar.sort();
+                    new_grammar.dedup();
                     // The Vosk grammar is the union *word* set, not the matcher's
                     // per-context narrowing. A scan storm (e.g. browser hints after a
                     // page nav) re-pushes commands constantly but rarely changes the
