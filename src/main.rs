@@ -146,6 +146,11 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     let mut new_grammar: Vec<String> = words.iter()
                         .filter_map(|v| v.as_str().map(String::from))
                         .collect();
+                    // The platform sends a pure engine-agnostic word list;
+                    // Vosk's unknown-word sentinel is this stage's concern.
+                    // Append before sort/dedup so the unchanged-set guard
+                    // sees a canonical set either way.
+                    new_grammar.push("[unk]".to_string());
                     // Canonicalize to a sorted, deduped SET before the unchanged-set
                     // guard below — the guard must compare word-set membership, not
                     // list order or duplicates. Upstream occasionally emits a word
