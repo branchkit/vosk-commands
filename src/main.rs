@@ -195,8 +195,24 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                             samples_since_finalize = 0;
                             skip_next_reset = true;
                             force_finalize_samples = force_finalize();
+                            // Log the word-set DELTA, not the full grammar —
+                            // rebuilds only fire on real changes (the actuator
+                            // dedups unchanged broadcasts upstream), and the
+                            // full ~300-word dump per rebuild was log noise.
+                            let ff_ms = if force_finalize_samples == 0 { 0 } else { (force_finalize_samples as f32 / SAMPLE_RATE * 1000.0) as u32 };
+                            match &last_grammar {
+                                Some(old) => {
+                                    let old_set: std::collections::HashSet<&str> = old.iter().map(|s| s.as_str()).collect();
+                                    let new_set: std::collections::HashSet<&str> = new_grammar.iter().map(|s| s.as_str()).collect();
+                                    let added: Vec<&str> = new_grammar.iter().map(|s| s.as_str()).filter(|w| !old_set.contains(w)).collect();
+                                    let removed: Vec<&str> = old.iter().map(|s| s.as_str()).filter(|w| !new_set.contains(w)).collect();
+                                    vlog!("vocabulary updated to {} words (+{} -{}, force_finalize_ms={}) added={:?} removed={:?}", new_grammar.len(), added.len(), removed.len(), ff_ms, added, removed);
+                                }
+                                None => {
+                                    vlog!("initial vocabulary — {} words (force_finalize_ms={})", new_grammar.len(), ff_ms);
+                                }
+                            }
                             last_grammar = Some(new_grammar.clone());
-                            vlog!("vocabulary updated to {} words (force_finalize_ms={}): {:?}", new_grammar.len(), if force_finalize_samples == 0 { 0 } else { (force_finalize_samples as f32 / SAMPLE_RATE * 1000.0) as u32 }, new_grammar);
                         }
                     }
                 }
