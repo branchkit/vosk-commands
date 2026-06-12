@@ -83,6 +83,7 @@ impl SwapPolicy {
         self.applied.as_deref()
     }
 
+    #[cfg(test)]
     pub fn has_pending(&self) -> bool {
         self.pending.is_some()
     }
