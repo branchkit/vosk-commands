@@ -202,8 +202,18 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     // grammar it started with instead of being truncated.
                     // Continuous mode is never idle — its boundaries are
                     // the force-finalize ticks.
-                    let decoder_idle = lifecycle_mode != LifecycleMode::Continuous
-                        && current_session.is_none();
+                    // A decoder that has accepted no audio since its last
+                    // finalize/reset holds no utterance state either — swap
+                    // immediately even in continuous mode. Without this, an
+                    // update landing milliseconds AFTER a finalize parks
+                    // until the NEXT boundary, which can drop the swap into
+                    // the middle of the user's next word (observed live: a
+                    // speak-start +2-word update arrived 2ms post-finalize,
+                    // parked 4.8s, then swapped right as "speak over" began
+                    // and clipped it to "over").
+                    let decoder_idle = (lifecycle_mode != LifecycleMode::Continuous
+                        && current_session.is_none())
+                        || samples_since_finalize == 0;
                     match policy.on_vocabulary_update(new_grammar, decoder_idle) {
                         UpdateAction::TweakOnly => {}
                         UpdateAction::SwapNow(words) => {
