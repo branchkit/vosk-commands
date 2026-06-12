@@ -10,6 +10,9 @@ use serde_json::Value;
 use tokio::io::{stdin, stdout};
 use vosk::{CompleteResult, DecodingState, Model, Recognizer};
 
+mod swap;
+use swap::{SwapPolicy, UpdateAction};
+
 const SAMPLE_RATE: f32 = 16000.0;
 
 // Stage log line: leading RFC3339-millis UTC timestamp matching actuator.log's
@@ -131,8 +134,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut last_partial: Option<String> = None;
     let mut force_finalize_samples: u32 = (SAMPLE_RATE * 0.8) as u32;
     const DEFAULT_FORCE_FINALIZE_SAMPLES: u32 = (SAMPLE_RATE * 0.8) as u32;
-    // Word set behind the live recognizer, used to skip redundant rebuilds.
-    let mut last_grammar: Option<Vec<String>> = None;
+    // Swap policy: tracks the applied word set (redundant-rebuild guard)
+    // and parks genuinely-new sets that arrive mid-decode for the next
+    // safe boundary (DESIGN_VOSK_REBUILD_BOUNDARIES).
+    let mut policy = SwapPolicy::new();
 
     loop {
         let event = match reader.read_event().await? {
@@ -186,44 +191,42 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                             }
                         }
                     };
-                    if dynamic_recognizer.is_some() && last_grammar.as_deref() == Some(new_grammar.as_slice()) {
-                        force_finalize_samples = force_finalize();
-                    } else {
-                        let refs: Vec<&str> = new_grammar.iter().map(|s| s.as_str()).collect();
-                        if let Some(mut new_rec) = Recognizer::new_with_grammar(&model, SAMPLE_RATE, &refs) {
-                            new_rec.set_partial_words(true);
-                            new_rec.set_words(true);
-                            new_rec.set_max_alternatives(3);
-                            let silence = vec![0i16; (SAMPLE_RATE * 0.3) as usize];
-                            let _ = new_rec.accept_waveform(&silence);
-                            dynamic_recognizer = Some(new_rec);
-                            samples_since_finalize = 0;
-                            skip_next_reset = true;
-                            force_finalize_samples = force_finalize();
-                            // Log the word-set DELTA, not the full grammar —
-                            // rebuilds only fire on real changes (the actuator
-                            // dedups unchanged broadcasts upstream), and the
-                            // full ~300-word dump per rebuild was log noise.
-                            let ff_ms = if force_finalize_samples == 0 { 0 } else { (force_finalize_samples as f32 / SAMPLE_RATE * 1000.0) as u32 };
-                            match &last_grammar {
-                                Some(old) => {
-                                    let old_set: std::collections::HashSet<&str> = old.iter().map(|s| s.as_str()).collect();
-                                    let new_set: std::collections::HashSet<&str> = new_grammar.iter().map(|s| s.as_str()).collect();
-                                    let added: Vec<&str> = new_grammar.iter().map(|s| s.as_str()).filter(|w| !old_set.contains(w)).collect();
-                                    let removed: Vec<&str> = old.iter().map(|s| s.as_str()).filter(|w| !new_set.contains(w)).collect();
-                                    vlog!("vocabulary updated to {} words (+{} -{}, force_finalize_ms={}) added={:?} removed={:?}", new_grammar.len(), added.len(), removed.len(), ff_ms, added, removed);
-                                }
-                                None => {
-                                    vlog!("initial vocabulary — {} words (force_finalize_ms={})", new_grammar.len(), ff_ms);
-                                }
+                    // Force-finalize is loop state, not recognizer state —
+                    // apply it on receipt regardless of whether the word
+                    // set swaps now, later, or not at all.
+                    force_finalize_samples = force_finalize();
+                    // A genuinely-new set rebuilds immediately only when
+                    // the decoder holds no utterance state; mid-decode it
+                    // is parked and swapped at the next safe boundary, so
+                    // the in-flight utterance keeps decoding against the
+                    // grammar it started with instead of being truncated.
+                    // Continuous mode is never idle — its boundaries are
+                    // the force-finalize ticks.
+                    let decoder_idle = lifecycle_mode != LifecycleMode::Continuous
+                        && current_session.is_none();
+                    match policy.on_vocabulary_update(new_grammar, decoder_idle) {
+                        UpdateAction::TweakOnly => {}
+                        UpdateAction::SwapNow(words) => {
+                            if build_and_swap(
+                                &model, words, &mut dynamic_recognizer, &mut policy,
+                                &mut samples_since_finalize, &mut last_partial,
+                                "idle", ff_ms(force_finalize_samples),
+                            ).is_ok() {
+                                skip_next_reset = true;
                             }
-                            last_grammar = Some(new_grammar.clone());
+                        }
+                        UpdateAction::Deferred => {
+                            vlog!(
+                                "vocabulary change parked — decoder active; swapping at next boundary (force_finalize_ms={} applied now)",
+                                ff_ms(force_finalize_samples),
+                            );
                         }
                     }
                 }
             }
             "recognizer_reset" => {
                 dynamic_recognizer = None;
+                policy.on_reset();
                 full_recognizer.reset();
                 let silence = vec![0i16; (SAMPLE_RATE * 0.3) as usize];
                 let _ = full_recognizer.accept_waveform(&silence);
@@ -239,6 +242,18 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 if let Some(sid) = event.data.get("session_id").and_then(Value::as_str) {
                     current_session = Some(sid.to_string());
                     vlog!("session start: {}", &sid[..8.min(sid.len())]);
+                }
+                // Boundary: nothing decoded yet this session — a parked
+                // vocabulary can swap in before any speech arrives.
+                if let Some(words) = policy.take_pending() {
+                    match build_and_swap(
+                        &model, words, &mut dynamic_recognizer, &mut policy,
+                        &mut samples_since_finalize, &mut last_partial,
+                        "audio_start", ff_ms(force_finalize_samples),
+                    ) {
+                        Ok(()) => skip_next_reset = true,
+                        Err(words) => policy.restore_pending(words),
+                    }
                 }
                 if skip_next_reset {
                     skip_next_reset = false;
@@ -307,6 +322,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 };
 
+                let finalize_boundary = result.is_some();
                 if let Some(result) = result {
                     let forced = force_finalize;
                     let (text, confidence, alts) = extract_best_result(&result)
@@ -343,6 +359,24 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                             })?,
                         ))
                         .await?;
+                }
+
+                // Boundary: a final (natural or forced) was just emitted,
+                // so the decoder holds no utterance state — a parked
+                // vocabulary swaps in cleanly. No skip_next_reset here:
+                // the new recognizer will consume audio for the rest of
+                // the hold, so the next audio_start must reset as usual.
+                if finalize_boundary {
+                    if let Some(words) = policy.take_pending() {
+                        let reason = if force_finalize { "force_finalized" } else { "finalized" };
+                        if let Err(words) = build_and_swap(
+                            &model, words, &mut dynamic_recognizer, &mut policy,
+                            &mut samples_since_finalize, &mut last_partial,
+                            reason, ff_ms(force_finalize_samples),
+                        ) {
+                            policy.restore_pending(words);
+                        }
+                    }
                 }
 
                 // Replenish credit
@@ -396,11 +430,91 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     ))
                     .await?;
                 current_session = None;
+                // Boundary: final_result was just taken; no audio flows
+                // until the next audio_start, so the fresh recognizer
+                // stays virgin — skip its reset next session.
+                if let Some(words) = policy.take_pending() {
+                    match build_and_swap(
+                        &model, words, &mut dynamic_recognizer, &mut policy,
+                        &mut samples_since_finalize, &mut last_partial,
+                        "audio_stop", ff_ms(force_finalize_samples),
+                    ) {
+                        Ok(()) => skip_next_reset = true,
+                        Err(words) => policy.restore_pending(words),
+                    }
+                }
             }
             _ => {}
         }
     }
 
+    Ok(())
+}
+
+/// Display form of the force-finalize threshold for log lines.
+fn ff_ms(force_finalize_samples: u32) -> u32 {
+    if force_finalize_samples == 0 {
+        0
+    } else {
+        (force_finalize_samples as f32 / SAMPLE_RATE * 1000.0) as u32
+    }
+}
+
+/// Build a recognizer for `words`, pre-feed warm-up silence, and swap it
+/// in. Logs the word-set delta plus build cost (the phase-0 measurement
+/// for DESIGN_VOSK_REBUILD_BOUNDARIES). On failure the old recognizer
+/// stays live and the words come back in `Err` so the caller can re-park
+/// them for a retry at the next boundary.
+#[allow(clippy::too_many_arguments)]
+fn build_and_swap(
+    model: &Model,
+    words: Vec<String>,
+    dynamic_recognizer: &mut Option<Recognizer>,
+    policy: &mut SwapPolicy,
+    samples_since_finalize: &mut u32,
+    last_partial: &mut Option<String>,
+    reason: &str,
+    ff_ms: u32,
+) -> Result<(), Vec<String>> {
+    let refs: Vec<&str> = words.iter().map(|s| s.as_str()).collect();
+    let t0 = std::time::Instant::now();
+    let Some(mut new_rec) = Recognizer::new_with_grammar(model, SAMPLE_RATE, &refs) else {
+        vlog!("recognizer build FAILED ({} words, at {})", words.len(), reason);
+        return Err(words);
+    };
+    new_rec.set_partial_words(true);
+    new_rec.set_words(true);
+    new_rec.set_max_alternatives(3);
+    let built = t0.elapsed();
+    let silence = vec![0i16; (SAMPLE_RATE * 0.3) as usize];
+    let _ = new_rec.accept_waveform(&silence);
+    let total = t0.elapsed();
+    *dynamic_recognizer = Some(new_rec);
+    *samples_since_finalize = 0;
+    *last_partial = None;
+    // Log the word-set DELTA, not the full grammar — rebuilds only fire
+    // on real changes (the actuator dedups unchanged broadcasts upstream),
+    // and the full ~300-word dump per rebuild was log noise.
+    match policy.applied() {
+        Some(old) => {
+            let old_set: std::collections::HashSet<&str> = old.iter().map(|s| s.as_str()).collect();
+            let new_set: std::collections::HashSet<&str> = words.iter().map(|s| s.as_str()).collect();
+            let added: Vec<&str> = words.iter().map(|s| s.as_str()).filter(|w| !old_set.contains(w)).collect();
+            let removed: Vec<&str> = old.iter().map(|s| s.as_str()).filter(|w| !new_set.contains(w)).collect();
+            vlog!(
+                "vocabulary updated to {} words (+{} -{}, force_finalize_ms={}, swap at {}, build {:.1?} + prefeed {:.1?}) added={:?} removed={:?}",
+                words.len(), added.len(), removed.len(), ff_ms, reason,
+                built, total - built, added, removed,
+            );
+        }
+        None => {
+            vlog!(
+                "initial vocabulary — {} words (force_finalize_ms={}, swap at {}, build {:.1?} + prefeed {:.1?})",
+                words.len(), ff_ms, reason, built, total - built,
+            );
+        }
+    }
+    policy.note_applied(words);
     Ok(())
 }
 
