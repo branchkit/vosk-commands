@@ -64,26 +64,18 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     full_recognizer.set_words(true);
     full_recognizer.set_max_alternatives(3);
 
-    // Dynamic recognizer is (re)created on every `vocabulary_update` event
-    // and dropped on `recognizer_reset`. When None, `full_recognizer` (the
-    // startup-loaded grammar) is the active one.
+    // Dynamic recognizer is (re)created when a `vocabulary_update` event
+    // carries a genuinely new word set. When None, `full_recognizer` (the
+    // startup-loaded grammar) is active — only the case before the first
+    // update arrives.
     //
-    // What "dynamic" actually holds varies by sender — and historically
-    // the variable name was "narrowed_recognizer", which was misleading:
-    //
-    //   - Voice plugin's LockForSpeak / LockForSandbox push a *truly
-    //     narrow* word list (13 stop phrases / sandbox test words). These
-    //     are acoustic-task modes; narrowing is the point.
-    //   - Voice plugin's Init/Refresh push the full union grammar
-    //     (every command's words + plugin HWMs). Not narrowing — refresh.
-    //   - `vocabulary.commit` from any plugin (browser hints, etc.) goes
-    //     through the actuator's `send_vocabulary_update` path which
-    //     builds the full union vocab. Not narrowing — refresh.
-    //
-    // The recognizer slot is the same in all cases; only the word count
-    // tells you whether you're in an acoustic-task narrow mode vs. a
-    // routine refresh. Operator: read the word count, not the variable
-    // name.
+    // "Dynamic" always holds the full union grammar (every command's
+    // words + plugin HWMs): voice's Init/Refresh/speak injects and the
+    // actuator's `send_vocabulary_update` broadcasts build from the same
+    // union. Vosk-layer narrowing is retired (DESIGN_SPEAK_STOP_GRAMMAR
+    // removed the last one, LockForSpeak) — context narrowing happens in
+    // the matcher's filtering layer, and speak dictation varies only
+    // `force_finalize_ms`, never the word set.
     let mut dynamic_recognizer: Option<Recognizer> = None;
 
     macro_rules! active_rec {
@@ -233,16 +225,6 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                         }
                     }
                 }
-            }
-            "recognizer_reset" => {
-                dynamic_recognizer = None;
-                policy.on_reset();
-                full_recognizer.reset();
-                let silence = vec![0i16; (SAMPLE_RATE * 0.3) as usize];
-                let _ = full_recognizer.accept_waveform(&silence);
-                samples_since_finalize = 0;
-                force_finalize_samples = DEFAULT_FORCE_FINALIZE_SAMPLES;
-                vlog!("recognizer reset → startup grammar (cached)");
             }
             "audio_start" => {
                 if lifecycle_mode == LifecycleMode::Continuous {

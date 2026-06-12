@@ -22,8 +22,8 @@ pub enum UpdateAction {
 #[derive(Debug, Default)]
 pub struct SwapPolicy {
     /// Set behind the live dynamic recognizer. None = startup recognizer
-    /// is live (post-reset or pre-first-update) — in that state no
-    /// incoming set is "unchanged", matching the old guard's
+    /// is live (pre-first-update) — in that state no incoming set is
+    /// "unchanged", matching the old guard's
     /// `dynamic_recognizer.is_some()` requirement.
     applied: Option<Vec<String>>,
     pending: Option<Vec<String>>,
@@ -85,15 +85,6 @@ impl SwapPolicy {
 
     pub fn has_pending(&self) -> bool {
         self.pending.is_some()
-    }
-
-    /// `recognizer_reset`: the resetter is asserting the startup grammar.
-    /// Drop the pending set (a stale union must not resurrect later) and
-    /// forget the applied set (the startup recognizer is live now, so no
-    /// future update may be skipped as "unchanged").
-    pub fn on_reset(&mut self) {
-        self.pending = None;
-        self.applied = None;
     }
 }
 
@@ -158,18 +149,6 @@ mod tests {
         assert_eq!(p.on_vocabulary_update(w(&["c"]), false), UpdateAction::Deferred);
         assert_eq!(p.take_pending(), Some(w(&["c"])));
         assert_eq!(p.take_pending(), None);
-    }
-
-    #[test]
-    fn reset_drops_pending_and_disables_unchanged_guard() {
-        let mut p = SwapPolicy::new();
-        p.note_applied(w(&["a"]));
-        assert_eq!(p.on_vocabulary_update(w(&["b"]), false), UpdateAction::Deferred);
-        p.on_reset();
-        assert_eq!(p.take_pending(), None);
-        // Same words as the pre-reset applied set must NOT be treated as
-        // unchanged — the startup recognizer is live now.
-        assert_eq!(p.on_vocabulary_update(w(&["a"]), true), UpdateAction::SwapNow(w(&["a"])));
     }
 
     #[test]
