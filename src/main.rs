@@ -601,14 +601,18 @@ fn resolve_relative_to_exe(path: &str) -> PathBuf {
     if p.is_absolute() || p.exists() {
         return p;
     }
-    // Application Support models directory (primary location)
-    if let Some(home) = env::var_os("HOME") {
-        let name = if env::var("BRANCHKIT_DEV").is_ok() { "BranchKitDev" } else { "BranchKit" };
-        let app_support = PathBuf::from(home)
-            .join("Library/Application Support")
-            .join(name)
-            .join("models/vosk")
-            .join(&p);
+    // Platform data dir models directory (primary location):
+    // macOS ~/Library/Application Support, elsewhere XDG data home.
+    let name = if env::var("BRANCHKIT_DEV").is_ok() { "BranchKitDev" } else { "BranchKit" };
+    let data_base = if cfg!(target_os = "macos") {
+        env::var_os("HOME").map(|h| PathBuf::from(h).join("Library/Application Support"))
+    } else {
+        env::var_os("XDG_DATA_HOME")
+            .map(PathBuf::from)
+            .or_else(|| env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share")))
+    };
+    if let Some(base) = data_base {
+        let app_support = base.join(name).join("models/vosk").join(&p);
         if app_support.exists() {
             return app_support;
         }
