@@ -124,6 +124,11 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut skip_next_reset = false;
     let mut samples_since_finalize: u32 = 0;
     let mut last_partial: Option<String> = None;
+    // Recognition-latency tracking (PERF), mirrors the sherpa stage: onset = first
+    // speech of the utterance, last_speech = most recent partial growth. tail
+    // (last_speech -> emit) is the finalization wait — the engine-comparable lag.
+    let mut utterance_onset: Option<std::time::Instant> = None;
+    let mut last_speech_at: Option<std::time::Instant> = None;
     let mut force_finalize_samples: u32 = (SAMPLE_RATE * 0.8) as u32;
     const DEFAULT_FORCE_FINALIZE_SAMPLES: u32 = (SAMPLE_RATE * 0.8) as u32;
     // Swap policy: tracks the applied word set (redundant-rebuild guard)
@@ -300,7 +305,15 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                         let pr = active_rec!().partial_result();
                         let text = pr.partial.trim();
                         if !text.is_empty() {
-                            last_partial = Some(strip_unk(text));
+                            let now = std::time::Instant::now();
+                            if utterance_onset.is_none() {
+                                utterance_onset = Some(now);
+                            }
+                            let stripped = strip_unk(text);
+                            if last_partial.as_deref() != Some(&stripped) {
+                                last_speech_at = Some(now);
+                            }
+                            last_partial = Some(stripped);
                         }
                         None
                     }
@@ -327,15 +340,19 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                         last_partial = None;
                         None
                     };
+                    // PERF: total = onset->emit (incl. speaking); tail = last_speech->emit
+                    // (the finalization wait — directly comparable to the sherpa stage).
+                    let total_ms = utterance_onset.take().map(|t| t.elapsed().as_millis()).unwrap_or(0);
+                    let tail_ms = last_speech_at.take().map(|t| t.elapsed().as_millis()).unwrap_or(0);
                     if !text.is_empty() {
                         let tag = if forced { " (forced)" } else { "" };
                         let rec_tag = if is_dynamic { " [dynamic]" } else { " [startup]" };
-                        vlog!("recognized{tag}{rec_tag}: \"{text}\" conf={confidence:.2}");
+                        vlog!("[PERF] recognized{tag}{rec_tag}: \"{text}\" conf={confidence:.2} total={total_ms}ms tail={tail_ms}ms");
                     } else {
                         let tag = if forced { " (forced)" } else { "" };
                         let rec_tag = if is_dynamic { " [dynamic]" } else { " [startup]" };
                         let hint = partial_hint.as_deref().unwrap_or("");
-                        vlog!("empty{tag}{rec_tag}: conf={confidence:.2} last_partial=\"{hint}\"");
+                        vlog!("empty{tag}{rec_tag}: conf={confidence:.2} last_partial=\"{hint}\" tail={tail_ms}ms");
                     }
                     writer
                         .write_event(&Event::new(
@@ -400,11 +417,13 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     last_partial = None;
                     None
                 };
+                let total_ms = utterance_onset.take().map(|t| t.elapsed().as_millis()).unwrap_or(0);
+                let tail_ms = last_speech_at.take().map(|t| t.elapsed().as_millis()).unwrap_or(0);
                 if !text.is_empty() {
-                    vlog!("final: \"{text}\" conf={confidence:.2}");
+                    vlog!("[PERF] final: \"{text}\" conf={confidence:.2} total={total_ms}ms tail={tail_ms}ms");
                 } else {
                     let hint = partial_hint.as_deref().unwrap_or("");
-                    vlog!("final: empty conf={confidence:.2} last_partial=\"{hint}\"");
+                    vlog!("final: empty conf={confidence:.2} last_partial=\"{hint}\" tail={tail_ms}ms");
                 }
                 let session_id = current_session.take().unwrap_or_default();
                 writer
