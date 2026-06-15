@@ -288,9 +288,38 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 let is_dynamic = dynamic_recognizer.is_some();
                 let state = active_rec!().accept_waveform(&samples);
 
+                // Track utterance timing from the running partial on EVERY chunk,
+                // before the finalize decision — so forced/natural finals carry a
+                // real total/tail (the finalization wait), directly comparable to
+                // the sherpa stage. Previously this lived inside the non-forced
+                // Running arm, so the dominant forced 800ms-chop path skipped it
+                // and emitted total=0/tail=0 (an instrumentation gap, not 0 latency).
+                if matches!(state, Ok(DecodingState::Running)) {
+                    let pr = active_rec!().partial_result();
+                    let text = pr.partial.trim();
+                    if !text.is_empty() {
+                        let now = std::time::Instant::now();
+                        if utterance_onset.is_none() {
+                            utterance_onset = Some(now);
+                        }
+                        let stripped = strip_unk(text);
+                        if last_partial.as_deref() != Some(&stripped) {
+                            last_speech_at = Some(now);
+                        }
+                        last_partial = Some(stripped);
+                    }
+                }
+
                 let force_finalize = force_finalize_samples > 0
                     && matches!(state, Ok(DecodingState::Running))
                     && samples_since_finalize >= force_finalize_samples;
+
+                // Width of the force-finalize window that gated this emit — the
+                // blind-chop period (~800ms with no native endpointer). Logged so
+                // the latency vosk adds by waiting for the chop is visible per-emit
+                // instead of inferred from the emit cadence.
+                let window_ms =
+                    (samples_since_finalize as f32 / SAMPLE_RATE as f32 * 1000.0) as u32;
 
                 let result = match state {
                     Ok(DecodingState::Finalized) => {
@@ -301,22 +330,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                         samples_since_finalize = 0;
                         Some(active_rec!().final_result())
                     }
-                    Ok(DecodingState::Running) => {
-                        let pr = active_rec!().partial_result();
-                        let text = pr.partial.trim();
-                        if !text.is_empty() {
-                            let now = std::time::Instant::now();
-                            if utterance_onset.is_none() {
-                                utterance_onset = Some(now);
-                            }
-                            let stripped = strip_unk(text);
-                            if last_partial.as_deref() != Some(&stripped) {
-                                last_speech_at = Some(now);
-                            }
-                            last_partial = Some(stripped);
-                        }
-                        None
-                    }
+                    Ok(DecodingState::Running) => None,
                     Ok(DecodingState::Failed) => {
                         vlog!("decoding failed");
                         None
@@ -347,12 +361,12 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     if !text.is_empty() {
                         let tag = if forced { " (forced)" } else { "" };
                         let rec_tag = if is_dynamic { " [dynamic]" } else { " [startup]" };
-                        vlog!("[PERF] recognized{tag}{rec_tag}: \"{text}\" conf={confidence:.2} total={total_ms}ms tail={tail_ms}ms");
+                        vlog!("[PERF] recognized{tag}{rec_tag}: \"{text}\" conf={confidence:.2} total={total_ms}ms tail={tail_ms}ms window={window_ms}ms");
                     } else {
                         let tag = if forced { " (forced)" } else { "" };
                         let rec_tag = if is_dynamic { " [dynamic]" } else { " [startup]" };
                         let hint = partial_hint.as_deref().unwrap_or("");
-                        vlog!("empty{tag}{rec_tag}: conf={confidence:.2} last_partial=\"{hint}\" tail={tail_ms}ms");
+                        vlog!("empty{tag}{rec_tag}: conf={confidence:.2} last_partial=\"{hint}\" tail={tail_ms}ms window={window_ms}ms");
                     }
                     writer
                         .write_event(&Event::new(
