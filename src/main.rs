@@ -15,23 +15,21 @@ use swap::{SwapPolicy, UpdateAction};
 
 const SAMPLE_RATE: f32 = 16000.0;
 
-// Stage log line: leading RFC3339-millis UTC timestamp matching actuator.log's
-// `[2026-06-01T05:55:13.116Z]` prefix so the two logs correlate on one clock,
-// then the `[vosk_commands]` tag. Use this instead of bare `eprintln!`.
+// Stage diagnostics route through the shared stage logger
+// (`branch_actuator::pipeline::stage_log`): one canonical `BKLOG1` line the
+// actuator parses into a correlated `stage.diagnostic` bus event (timestamp +
+// stage name live on the bus envelope, so the line carries neither). `vlog!`
+// defaults to `info`; the session id is stamped ambiently from `set_session`.
 macro_rules! vlog {
     ($($arg:tt)*) => {{
-        eprintln!(
-            "[{}] [vosk_commands] {}",
-            chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ"),
-            format_args!($($arg)*)
-        );
+        branch_actuator::pipeline::stage_log::info(&format!($($arg)*));
     }};
 }
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
     if let Err(e) = run().await {
-        vlog!("fatal: {e}");
+        branch_actuator::pipeline::stage_log::error(&format!("fatal: {e}"));
         process::exit(1);
     }
 }
@@ -238,6 +236,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 if let Some(sid) = event.data.get("session_id").and_then(Value::as_str) {
                     current_session = Some(sid.to_string());
+                    branch_actuator::pipeline::stage_log::set_session(sid);
                     vlog!("session start: {}", &sid[..8.min(sid.len())]);
                 }
                 // Boundary: nothing decoded yet this session — a parked
@@ -275,6 +274,13 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
             "audio_chunk" => {
                 let chunk: AudioChunk = serde_json::from_value(event.data.clone())?;
+                // Stamp the ambient log session from the chunk so every
+                // diagnostic emitted while decoding this segment (incl. the
+                // [PERF] lines) correlates — covers continuous mode too, where
+                // audio_start carries no session.
+                if !chunk.session_id.is_empty() {
+                    branch_actuator::pipeline::stage_log::set_session(&chunk.session_id);
+                }
                 let payload = &event.payload;
 
                 // Decode i16 PCM
@@ -455,6 +461,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     ))
                     .await?;
                 current_session = None;
+                branch_actuator::pipeline::stage_log::clear_session();
                 // Boundary: final_result was just taken; no audio flows
                 // until the next audio_start, so the fresh recognizer
                 // stays virgin — skip its reset next session.
